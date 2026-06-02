@@ -3,7 +3,9 @@ mod ffmpeg;
 mod logger;
 mod state;
 
+use ffmpeg::Recorder;
 use state::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,6 +21,13 @@ pub fn run() {
             commands::get_recording_error,
             commands::get_logs,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let state = window.state::<AppState>();
+                let _ = state.recorder.stop();
+                Recorder::kill_all();
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

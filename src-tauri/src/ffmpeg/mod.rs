@@ -426,23 +426,40 @@ impl Recorder {
         if let Ok(mut e) = self.error.lock() {
             *e = None;
         }
-        match child.take() {
-            Some(mut process) => {
-                let pid = process.id();
-                let _ = process.kill();
-                let _ = process.wait();
-                // Kill entire process tree (ffmpeg child of yt-dlp)
-                let _ = Command::new("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map(|mut c| c.wait());
-                self.logger.log("Grabación detenida");
-                Ok(())
+        if let Some(mut process) = child.take() {
+            let pid = process.id();
+            let _ = process.kill();
+            let _ = process.wait();
+            // Kill entire process tree (ffmpeg child of yt-dlp)
+            if let Ok(mut tk) = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let _ = tk.wait();
             }
-            None => Err("No hay ninguna grabación activa".to_string()),
+            self.logger.log("Grabación detenida");
+            Ok(())
+        } else {
+            Err("No hay ninguna grabación activa".to_string())
         }
+    }
+
+    /// Kill any lingering yt-dlp/ffmpeg processes (safety net for app close)
+    pub fn kill_all() {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "yt-dlp.exe"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut c| c.wait());
+        let _ = Command::new("taskkill")
+            .args(["/F", "/IM", "ffmpeg.exe"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .and_then(|mut c| c.wait());
     }
 
     pub fn is_recording(&self) -> bool {
