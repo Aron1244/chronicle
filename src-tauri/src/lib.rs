@@ -17,14 +17,17 @@ pub fn run() {
             commands::start_recording,
             commands::fetch_formats,
             commands::stop_recording,
+            commands::stop_all_recordings,
+            commands::get_all_statuses,
             commands::get_recording_status,
             commands::get_recording_error,
             commands::get_logs,
+            commands::preview_stream,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 let state = window.state::<AppState>();
-                let _ = state.recorder.stop();
+                state.recorder.stop_all();
                 Recorder::kill_all();
             }
         })

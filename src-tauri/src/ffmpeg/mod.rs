@@ -1,9 +1,13 @@
 use crate::logger::Logger;
-use serde::Serialize;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+pub const MAX_SLOTS: usize = 3;
 
 #[derive(Debug, Serialize)]
 pub struct StreamFormat {
@@ -14,6 +18,24 @@ pub struct StreamFormat {
     pub bitrate: Option<f64>,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CompressionConfig {
+    pub crf: u32,
+    pub preset: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SlotStatus {
+    pub slot: usize,
+    pub recording: bool,
+    pub optimizing: bool,
+    pub error: Option<String>,
+    pub url: Option<String>,
+    pub label: Option<String>,
+    pub elapsed_secs: u64,
 }
 
 #[derive(Debug)]
@@ -23,14 +45,39 @@ enum RecorderBackend {
     Ffmpeg,
 }
 
-pub struct Recorder {
-    child: Mutex<Option<Child>>,
+struct SlotInfo {
+    url: String,
+    output_path: String,
+    label: String,
+    start_time: std::time::Instant,
+    compress: Option<CompressionConfig>,
+}
+
+struct SlotState {
+    child: Option<Child>,
     error: Arc<Mutex<Option<String>>>,
+    info: Option<SlotInfo>,
+    optimizing: Arc<AtomicBool>,
+}
+
+impl SlotState {
+    fn new() -> Self {
+        Self {
+            child: None,
+            error: Arc::new(Mutex::new(None)),
+            info: None,
+            optimizing: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+pub struct Recorder {
     ytdlp_path: PathBuf,
     streamlink_path: PathBuf,
     ffmpeg_path: PathBuf,
     plugin_dir: Option<PathBuf>,
     logger: Logger,
+    slots: Arc<Mutex<[SlotState; MAX_SLOTS]>>,
 }
 
 impl Recorder {
@@ -46,13 +93,16 @@ impl Recorder {
             logger.log(&format!("Plugin dir: {}", pd.display()));
         }
         Self {
-            child: Mutex::new(None),
-            error: Arc::new(Mutex::new(None)),
             ytdlp_path: yt,
             streamlink_path: sl,
             ffmpeg_path: ff,
             plugin_dir,
             logger,
+            slots: Arc::new(Mutex::new([
+                SlotState::new(),
+                SlotState::new(),
+                SlotState::new(),
+            ])),
         }
     }
 
@@ -121,6 +171,7 @@ impl Recorder {
                 let bitrate = f.get("tbr").and_then(|v| v.as_f64());
                 let video_codec = f.get("vcodec").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let audio_codec = f.get("acodec").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let url = f.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
 
                 // Skip storyboard/images formats
                 let is_video = resolution != "audio" && video_codec.as_deref() != Some("none");
@@ -133,6 +184,7 @@ impl Recorder {
                     bitrate,
                     video_codec,
                     audio_codec,
+                    url,
                 }
             })
             .filter(|f| !f.resolution.is_empty() || f.audio_codec.is_some())
@@ -142,37 +194,91 @@ impl Recorder {
         Ok(formats)
     }
 
-    pub fn start(&self, url: &str, output_path: &str, format_id: Option<&str>) -> Result<String, String> {
-        let mut child = self.child.lock().map_err(|e| e.to_string())?;
-        if child.is_some() {
-            return Err("Ya hay una grabación en curso".to_string());
+    pub fn start(&self, slot: usize, url: &str, output_path: &str, format_id: Option<&str>, format_url: Option<&str>, compress: Option<CompressionConfig>) -> Result<String, String> {
+        if slot >= MAX_SLOTS {
+            return Err(format!("Slot {} inválido (máximo {})", slot, MAX_SLOTS - 1));
         }
 
-        if let Ok(mut e) = self.error.lock() {
+        let mut slots = self.slots.lock().map_err(|e| e.to_string())?;
+        let s = &mut slots[slot];
+
+        if s.child.is_some() {
+            return Err(format!("Slot {} ya está grabando", slot));
+        }
+
+        if let Ok(mut e) = s.error.lock() {
             *e = None;
         }
 
         let url = normalize_url(url);
-        self.logger
-            .log(&format!("Iniciando grabación: {} → {}", url, output_path));
+        let label = extract_label(&url);
+        self.logger.log(&format!("[Slot {}] Iniciando grabación: {} → {}", slot, url, output_path));
 
         let parent = std::path::Path::new(output_path)
             .parent()
             .ok_or("Ruta inválida")?;
         if let Err(e) = std::fs::create_dir_all(parent) {
-            self.logger.log(&format!("Error al crear carpeta: {}", e));
+            self.logger.log(&format!("[Slot {}] Error al crear carpeta: {}", slot, e));
             return Err(format!("Error al crear carpeta: {}", e));
         }
 
         let backend = self.detect_backend(&url);
-        self.logger
-            .log(&format!("Backend detectado: {:?}", backend));
+        self.logger.log(&format!("[Slot {}] Backend detectado: {:?}", slot, backend));
 
-        match backend {
-            RecorderBackend::Ytdlp => self.run_ytdlp(&url, output_path, format_id, &mut child),
-            RecorderBackend::Streamlink => self.run_streamlink(&url, output_path, &mut child),
-            RecorderBackend::Ffmpeg => self.run_ffmpeg(&url, output_path, &mut child),
+        let result = match backend {
+            RecorderBackend::Ytdlp => {
+                let mut fmt_err: Option<String> = None;
+
+                if format_id.is_some() {
+                    match self.run_ytdlp(&url, output_path, format_id, s) {
+                        Ok(msg) => Ok(msg),
+                        Err(e) => {
+                            self.logger.log(&format!("[Slot {}] yt-dlp con formato falló: {}. Reintentando sin formato...", slot, e));
+                            fmt_err = Some(e);
+                            self.run_ytdlp(&url, output_path, None, s)
+                        }
+                    }
+                } else {
+                    self.run_ytdlp(&url, output_path, None, s)
+                }
+                .or_else(|e| {
+                    let ytdlp_extra = fmt_err.as_ref().map(|f| format!(" (con formato: {})", f)).unwrap_or_default();
+                    self.logger.log(&format!("[Slot {}] yt-dlp sin formato también falló: {}", slot, e));
+                    self.logger.log("Intentando con Streamlink como último recurso...");
+                    self.run_streamlink(&url, output_path, s)
+                        .or_else(|sl_err| {
+                            if let Some(furl) = format_url {
+                                let abs_url = resolve_url(&url, furl);
+                                self.logger.log(&format!("[Slot {}] Intentando con FFmpeg directo: {}", slot, abs_url));
+                                self.run_ffmpeg(&abs_url, output_path, s)
+                                    .map_err(|ff_err| format!(
+                                        "yt-dlp{} | Streamlink: {} | FFmpeg: {}", ytdlp_extra, sl_err, ff_err
+                                    ))
+                            } else {
+                                Err(format!("yt-dlp{} | Streamlink: {}", ytdlp_extra, sl_err))
+                            }
+                        })
+                })
+            }
+            RecorderBackend::Streamlink => {
+                self.run_streamlink(&url, output_path, s)
+            }
+            RecorderBackend::Ffmpeg => {
+                self.run_ffmpeg(&url, output_path, s)
+            }
+        };
+
+        if result.is_ok() {
+            s.info = Some(SlotInfo {
+                url: url.clone(),
+                output_path: output_path.to_string(),
+                label,
+                start_time: std::time::Instant::now(),
+                compress,
+            });
         }
+
+        result
     }
 
     fn needs_audio_merge(&self, url: &str, format_id: &str) -> bool {
@@ -215,7 +321,7 @@ impl Recorder {
         url: &str,
         output_path: &str,
         format_id: Option<&str>,
-        child: &mut Option<Child>,
+        slot: &mut SlotState,
     ) -> Result<String, String> {
         let exe = &self.ytdlp_path;
         let mut args: Vec<String> = vec!["--newline".into(), "--no-part".into()];
@@ -289,7 +395,7 @@ impl Recorder {
         // Stderr monitoring: spawn thread to detect errors during recording
         let err_child = process.stderr.take();
         let logger = self.logger.clone();
-        let error_state = self.error.clone();
+        let error_state = slot.error.clone();
         let child_for_monitor = process.try_wait().ok().flatten();
         if err_child.is_some() && child_for_monitor.is_none() {
             std::thread::spawn(move || {
@@ -313,7 +419,7 @@ impl Recorder {
             });
         }
 
-        *child = Some(process);
+        slot.child = Some(process);
         Ok("Grabando con yt-dlp".to_string())
     }
 
@@ -321,7 +427,7 @@ impl Recorder {
         &self,
         url: &str,
         output_path: &str,
-        child: &mut Option<Child>,
+        slot: &mut SlotState,
     ) -> Result<String, String> {
         let exe = &self.streamlink_path;
         self.logger.log(&format!(
@@ -359,18 +465,18 @@ impl Recorder {
             if msg.contains("No plugin can handle") && self.ytdlp_path.is_file() {
                 self.logger
                     .log("Streamlink no soporta la URL, probando con yt-dlp...");
-                return self.run_ytdlp(url, output_path, None, child);
+                return self.run_ytdlp(url, output_path, None, slot);
             }
             // Also try yt-dlp as fallback for any error
             if self.ytdlp_path.is_file() {
                 self.logger
                     .log("Streamlink falló, probando con yt-dlp...");
-                return self.run_ytdlp(url, output_path, None, child);
+                return self.run_ytdlp(url, output_path, None, slot);
             }
             return Err(format!("Streamlink falló: {}", msg));
         }
 
-        *child = Some(process);
+        slot.child = Some(process);
         Ok("Grabando con Streamlink".to_string())
     }
 
@@ -378,20 +484,18 @@ impl Recorder {
         &self,
         url: &str,
         output_path: &str,
-        child: &mut Option<Child>,
+        slot: &mut SlotState,
     ) -> Result<String, String> {
         let exe = &self.ffmpeg_path;
         self.logger.log(&format!(
-            "Ejecutando: {} -i {} -c copy -f mp4 -y {}",
+            "Ejecutando: {} -i {} -c copy -f matroska -y {}",
             exe.display(),
             url,
             output_path
         ));
-        let mut process = match Command::new(exe)
-            .args(["-i", url, "-c", "copy", "-f", "mp4", "-y", output_path])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let mut cmd = Command::new(exe);
+        cmd.args(["-i", url, "-c", "copy", "-f", "matroska", "-y", output_path]);
+        let mut process = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         {
             Ok(p) => p,
             Err(e) => {
@@ -416,34 +520,228 @@ impl Recorder {
             return Err(format!("FFmpeg falló: {}", msg));
         }
 
-        *child = Some(process);
+        slot.child = Some(process);
         Ok("Grabando con FFmpeg".to_string())
     }
 
-    pub fn stop(&self) -> Result<(), String> {
-        self.logger.log("Deteniendo grabación...");
-        let mut child = self.child.lock().map_err(|e| e.to_string())?;
-        if let Ok(mut e) = self.error.lock() {
+    pub fn stop(&self, slot: usize) -> Result<(), String> {
+        if slot >= MAX_SLOTS {
+            return Err(format!("Slot {} inválido", slot));
+        }
+        let mut slots = self.slots.lock().map_err(|e| e.to_string())?;
+        let s = &mut slots[slot];
+        self.logger.log(&format!("[Slot {}] Deteniendo grabación...", slot));
+        if let Ok(mut e) = s.error.lock() {
             *e = None;
         }
-        if let Some(mut process) = child.take() {
+        // Capture info before clearing
+        let compress = s.info.as_ref().and_then(|i| i.compress.clone());
+        let output_path = s.info.as_ref().map(|i| i.output_path.clone());
+        if let Some(mut process) = s.child.take() {
             let pid = process.id();
-            let _ = process.kill();
-            let _ = process.wait();
-            // Kill entire process tree (ffmpeg child of yt-dlp)
-            if let Ok(mut tk) = Command::new("taskkill")
+            let _ = Command::new("taskkill")
                 .args(["/F", "/T", "/PID", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-            {
-                let _ = tk.wait();
+                .and_then(|mut tk| tk.wait());
+            let _ = process.kill();
+            let _ = process.wait();
+            self.logger.log(&format!("[Slot {}] Grabación detenida", slot));
+            s.info = None;
+
+            // Post-processing: compress if configured
+            if let (Some(cfg), Some(path)) = (compress, output_path) {
+                s.optimizing.store(true, Ordering::SeqCst);
+                let ffmpeg = self.ffmpeg_path.clone();
+                drop(slots);
+                self.spawn_compression(slot, cfg, ffmpeg, path);
             }
-            self.logger.log("Grabación detenida");
+
             Ok(())
         } else {
-            Err("No hay ninguna grabación activa".to_string())
+            Err(format!("Slot {} no está grabando", slot))
         }
+    }
+
+    fn spawn_compression(
+        &self,
+        slot: usize,
+        cfg: CompressionConfig,
+        ffmpeg_path: PathBuf,
+        output_path: String,
+    ) {
+        if output_path.is_empty() {
+            return;
+        }
+        let logger = self.logger.clone();
+        let slots = self.slots.clone();
+        logger.log(&format!("[Slot {}] Comprimiendo video (CRF {})...", slot, cfg.crf));
+
+        std::thread::spawn(move || {
+            let tmp_path = format!("{}_tmp.mkv", output_path);
+            logger.log(&format!("[Slot {}] Ejecutando: {} -i \"{}\" -c:v libx264 -preset {} -crf {} -c:a aac -b:a 128k -y \"{}\"",
+                slot, ffmpeg_path.display(), output_path, cfg.preset, cfg.crf, tmp_path));
+
+            let output = Command::new(&ffmpeg_path)
+                .args([
+                    "-i", &output_path,
+                    "-c:v", "libx264",
+                    "-preset", &cfg.preset,
+                    "-crf", &cfg.crf.to_string(),
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-y", &tmp_path,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .and_then(|c| c.wait_with_output());
+
+            let mut slots = match slots.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+            };
+            let s = &mut slots[slot];
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let _ = std::fs::remove_file(&output_path);
+                    let _ = std::fs::rename(&tmp_path, &output_path);
+                    logger.log(&format!("[Slot {}] Compresión completada: {}", slot, output_path));
+                }
+                Ok(out) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let short = if msg.len() > 200 { format!("{}…", &msg[..200]) } else { msg };
+                    logger.log(&format!("[Slot {}] Compresión falló:\n{}", slot, short));
+                    if let Ok(mut e) = s.error.lock() {
+                        *e = Some(format!("Compresión falló: {}", short));
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    logger.log(&format!("[Slot {}] Error al ejecutar compresión: {}", slot, e));
+                    if let Ok(mut err) = s.error.lock() {
+                        *err = Some(format!("Error al ejecutar ffmpeg: {}", e));
+                    }
+                }
+            }
+            s.optimizing.store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub fn stop_all(&self) -> Vec<String> {
+        let mut results = Vec::new();
+        for slot in 0..MAX_SLOTS {
+            match self.stop(slot) {
+                Ok(_) => results.push(format!("Slot {} detenido", slot)),
+                Err(e) => results.push(format!("Slot {}: {}", slot, e)),
+            }
+        }
+        results
+    }
+
+    pub fn get_all_statuses(&self) -> Vec<SlotStatus> {
+        let mut slots = match self.slots.lock() {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let mut statuses = Vec::with_capacity(MAX_SLOTS);
+        for (i, s) in slots.iter_mut().enumerate() {
+            let running = match s.child.as_mut() {
+                Some(p) => p.try_wait().ok().map(|opt| opt.is_none()).unwrap_or(false),
+                None => false,
+            };
+            let optimizing = s.optimizing.load(Ordering::SeqCst);
+            let error = s.error.lock().ok().and_then(|mut e| e.take());
+            let info = s.info.as_ref();
+            let elapsed_secs = info.map(|inf| inf.start_time.elapsed().as_secs()).unwrap_or(0);
+            let url = info.map(|i| i.url.clone());
+            let label = info.map(|i| i.label.clone());
+            statuses.push(SlotStatus {
+                slot: i,
+                recording: running,
+                optimizing,
+                error,
+                url,
+                label,
+                elapsed_secs,
+            });
+        }
+        statuses
+    }
+
+    pub fn is_recording(&self, slot: usize) -> bool {
+        if slot >= MAX_SLOTS {
+            return false;
+        }
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let s = &mut slots[slot];
+        match s.child.as_mut() {
+            Some(p) => p.try_wait().ok().map(|opt| opt.is_none()).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    pub fn get_error(&self, slot: usize) -> Option<String> {
+        if slot >= MAX_SLOTS {
+            return None;
+        }
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        slots[slot].error.lock().ok().and_then(|mut e| e.take())
+    }
+
+    pub fn preview_stream(&self, url: &str) -> Result<String, String> {
+        let exe = &self.ffmpeg_path;
+        let mut cmd = Command::new(exe);
+        cmd.args([
+            "-analyzeduration", "500000",
+            "-probesize", "500000",
+            "-i", url,
+            "-vframes", "1",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-",
+        ]);
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Error al ejecutar ffmpeg: {}", e))?;
+
+        // Read up to 2MB of stdout (a PNG frame is usually much smaller)
+        let mut buf = Vec::new();
+        let mut stdout = child.stdout.take().ok_or("No se pudo leer stdout")?;
+        let timeout = std::time::Duration::from_secs(8);
+        let start = std::time::Instant::now();
+        loop {
+            let mut chunk = [0u8; 8192];
+            let readable = stdout.read(&mut chunk).map_err(|e| e.to_string())?;
+            if readable == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..readable]);
+            if buf.len() > 2_000_000 {
+                break;
+            }
+            if start.elapsed() > timeout {
+                let _ = child.kill();
+                return Err("Timeout generando preview".to_string());
+            }
+        }
+        let _ = child.wait();
+        if buf.is_empty() {
+            return Err("No se pudo capturar el frame — el stream podría ser el anuncio".to_string());
+        }
+        Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+    }
+
+    pub fn get_logs(&self) -> String {
+        self.logger.read_all()
     }
 
     /// Kill any lingering yt-dlp/ffmpeg processes (safety net for app close)
@@ -460,34 +758,6 @@ impl Recorder {
             .stderr(Stdio::null())
             .spawn()
             .and_then(|mut c| c.wait());
-    }
-
-    pub fn is_recording(&self) -> bool {
-        let running = self
-            .child
-            .lock()
-            .map(|mut c| {
-                c.as_mut()
-                    .map_or(false, |p| p.try_wait().map(|s| s.is_none()).unwrap_or(false))
-            })
-            .unwrap_or(false);
-        // If process died, clear error state on next poll
-        if !running {
-            if let Ok(mut e) = self.error.lock() {
-                if e.is_none() {
-                    *e = Some("El proceso de grabación terminó inesperadamente".to_string());
-                }
-            }
-        }
-        running
-    }
-
-    pub fn get_error(&self) -> Option<String> {
-        self.error.lock().ok().and_then(|mut e| e.take())
-    }
-
-    pub fn get_log(&self) -> String {
-        self.logger.read_all()
     }
 }
 
@@ -508,6 +778,28 @@ fn extract_error(stdout: &str, stderr: &str) -> String {
         .last()
         .unwrap_or("Error desconocido")
         .to_string()
+}
+
+fn extract_label(url: &str) -> String {
+    // Manual URL parsing without the `url` crate
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    if let Some(slash_pos) = rest.find('/') {
+        let path = &rest[slash_pos..];
+        let clean = path.trim_end_matches('/');
+        if let Some(last) = clean.rsplit('/').next().filter(|s| !s.is_empty()) {
+            return last.to_string();
+        }
+    }
+    // Fallback: domain
+    let domain = rest.split('/').next().unwrap_or(rest);
+    let parts: Vec<&str> = domain.split('.').collect();
+    if parts.len() >= 2 {
+        return parts[parts.len() - 2].to_string();
+    }
+    "stream".to_string()
 }
 
 fn find_binary(name: &str, fallback: &str, logger: &Logger) -> PathBuf {
@@ -544,7 +836,7 @@ fn find_binary(name: &str, fallback: &str, logger: &Logger) -> PathBuf {
 
     for path in &candidates {
         logger.log(&format!("  Buscando {} en {}", name, path.display()));
-        if path.exists() {
+        if path.exists() && is_valid_executable(path) {
             logger.log(&format!("  → Encontrado: {}", path.display()));
             return path.clone();
         }
@@ -552,6 +844,12 @@ fn find_binary(name: &str, fallback: &str, logger: &Logger) -> PathBuf {
 
     logger.log(&format!("  → No encontrado, usando fallback: {}", fallback));
     PathBuf::from(fallback)
+}
+
+fn is_valid_executable(path: &std::path::Path) -> bool {
+    path.metadata()
+        .map(|m| m.len() > 100_000)
+        .unwrap_or(false)
 }
 
 fn find_plugin_dir(logger: &Logger) -> Option<PathBuf> {
@@ -577,15 +875,11 @@ fn find_plugin_dir(logger: &Logger) -> Option<PathBuf> {
         if !path.exists() {
             continue;
         }
-        // yt-dlp plugin dirs can be structured as:
-        //   <dir>/yt_dlp_plugins/extractor/*.py  (direct)
-        //   <dir>/<subpkg>/yt_dlp_plugins/extractor/*.py  (subpackage)
         let direct = path.join("yt_dlp_plugins").join("extractor");
         if direct.exists() {
             logger.log(&format!("  → Plugin dir encontrado: {}", path.display()));
             return Some(path.clone());
         }
-        // scan subdirectories for yt_dlp_plugins package
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
@@ -603,8 +897,29 @@ fn find_plugin_dir(logger: &Logger) -> Option<PathBuf> {
     None
 }
 
+fn resolve_url(base: &str, maybe_relative: &str) -> String {
+    if maybe_relative.starts_with("http://") || maybe_relative.starts_with("https://") {
+        return maybe_relative.to_string();
+    }
+    if let Some(rest) = base.strip_prefix("https://").or_else(|| base.strip_prefix("http://")) {
+        if let Some(slash_idx) = rest.find('/') {
+            let base_domain = &rest[..slash_idx];
+            if maybe_relative.starts_with('/') {
+                return format!("https://{}{}", base_domain, maybe_relative);
+            }
+            let base_path = &rest[slash_idx..];
+            let last_slash = base_path.rfind('/');
+            if let Some(ls) = last_slash {
+                return format!("https://{}{}/{}", base_domain, &base_path[..ls], maybe_relative);
+            }
+            return format!("https://{}/{}", base_domain, maybe_relative);
+        }
+        return format!("https://{}/{}", rest, maybe_relative);
+    }
+    maybe_relative.to_string()
+}
+
 fn normalize_url(url: &str) -> String {
-    // Remove language subdomain from URLs like es.example.com -> example.com
     if let Some(rest) = url.strip_prefix("https://") {
         if let Some(dot_idx) = rest.find('.') {
             let domain_part = &rest[..dot_idx];
