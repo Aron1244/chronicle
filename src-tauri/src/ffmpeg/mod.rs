@@ -822,16 +822,17 @@ fn find_binary(name: &str, fallback: &str, logger: &Logger) -> PathBuf {
         project_root.join(name),
     ];
 
-    // Also search in Tauri resources directory (production build)
-    let resources_dir = exe_dir.join("resources");
-    if let Ok(entries) = std::fs::read_dir(&resources_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(name) {
-                candidates.push(p);
-            } else if p.is_dir() {
-                candidates.push(p.join(name));
-                candidates.push(p.join("bin").join(name));
+    // Also search in Tauri resource directories (production build)
+    for resource_dir in [exe_dir.join("resources"), exe_dir.join("_up_")] {
+        if let Ok(entries) = std::fs::read_dir(&resource_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(name) {
+                    candidates.push(p);
+                } else if p.is_dir() {
+                    candidates.push(p.join(name));
+                    candidates.push(p.join("bin").join(name));
+                }
             }
         }
     }
@@ -885,6 +886,7 @@ fn find_plugin_dir(logger: &Logger) -> Option<PathBuf> {
         exe_dir.join("yt-dlp-plugins"),
         project_root.join("yt-dlp-plugins"),
         resources_dir.join("yt-dlp-plugins"),
+        exe_dir.join("_up_").join("yt-dlp-plugins"),
     ];
 
     for path in &candidates {
