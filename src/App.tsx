@@ -41,7 +41,7 @@ interface SlotStatus {
   elapsed_secs: number
 }
 
-interface CompressionConfig { crf: number; preset: string }
+interface CompressionConfig { crf: number; preset: string; threads: number }
 
 type Theme = "system" | "light" | "dark"
 
@@ -73,6 +73,7 @@ function App() {
   const [compressEnabled, setCompressEnabled] = useState(false)
   const [compressCrf, setCompressCrf] = useState(23)
   const [compressPreset, setCompressPreset] = useState("medium")
+  const [compressThreads, setCompressThreads] = useState(0)
   const urlTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   // Dark mode
@@ -203,6 +204,7 @@ function App() {
     setCompressEnabled(false)
     setCompressCrf(23)
     setCompressPreset("medium")
+    setCompressThreads(0)
   }, [statuses])
 
   const pickFolder = useCallback(async () => {
@@ -220,7 +222,7 @@ function App() {
     }
     setStarting(true)
     const outputPath = `${outputFolder}\\${fileName}.mkv`
-    const compress: CompressionConfig | null = compressEnabled ? { crf: compressCrf, preset: compressPreset } : null
+    const compress: CompressionConfig | null = compressEnabled ? { crf: compressCrf, preset: compressPreset, threads: compressThreads } : null
     try {
       await invoke("start_recording", {
         slot: modalSlot,
@@ -506,9 +508,27 @@ function App() {
                         <option value="veryslow">Muy lento</option>
                       </select>
                     </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-muted-foreground w-8">Hilos</span>
+                      <select
+                        value={compressThreads}
+                        onChange={(e) => setCompressThreads(Number(e.target.value))}
+                        className="flex-1 h-7 rounded-md border border-input bg-background px-2 text-xs"
+                      >
+                        <option value={0}>Automático</option>
+                        <option value={1}>1 núcleo</option>
+                        <option value={2}>2 núcleos</option>
+                        <option value={4}>4 núcleos</option>
+                        <option value={6}>6 núcleos</option>
+                        <option value={8}>8 núcleos</option>
+                        <option value={12}>12 núcleos</option>
+                        <option value={16}>16 núcleos</option>
+                      </select>
+                    </div>
                     <p className="text-[11px] text-muted-foreground/50 leading-relaxed">
                       CRF 18 = casi sin pérdida, 23 = buena calidad, 28 = archivo pequeño.
                       Preset más lento = mejor compresión a costa de CPU.
+                      Hilos limita el uso de CPU durante la compresión.
                     </p>
                   </div>
                 )}

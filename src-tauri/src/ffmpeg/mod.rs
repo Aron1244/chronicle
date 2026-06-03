@@ -1,6 +1,7 @@
 use crate::logger::Logger;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -38,6 +39,7 @@ pub struct StreamFormat {
 pub struct CompressionConfig {
     pub crf: u32,
     pub preset: String,
+    pub threads: u32,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -93,6 +95,7 @@ pub struct Recorder {
     plugin_dir: Option<PathBuf>,
     logger: Logger,
     slots: Arc<Mutex<[SlotState; MAX_SLOTS]>>,
+    compress_queue: Arc<Mutex<VecDeque<(usize, CompressionConfig, PathBuf, String)>>>,
 }
 
 impl Recorder {
@@ -118,6 +121,7 @@ impl Recorder {
                 SlotState::new(),
                 SlotState::new(),
             ])),
+            compress_queue: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -372,6 +376,10 @@ impl Recorder {
                 args.push(dir_str.to_string());
             }
         }
+        if format_id.is_some() {
+            args.push("--merge-output-format".into());
+            args.push("mkv".into());
+        }
         args.extend_from_slice(&["-o".into(), output_path.into(), url.into()]);
 
         self.logger.log(&format!(
@@ -607,30 +615,67 @@ impl Recorder {
         if output_path.is_empty() {
             return;
         }
-        let logger = self.logger.clone();
+        let mut queue = self.compress_queue.lock().unwrap();
+        queue.push_back((slot, cfg, ffmpeg_path, output_path));
+        drop(queue);
+        self.dequeue_compress();
+    }
+
+    fn dequeue_compress(&self) {
+        let queue = self.compress_queue.clone();
         let slots = self.slots.clone();
+        let logger = self.logger.clone();
+        // Check if any slot is already compressing
+        let any_running = {
+            if let Ok(s) = slots.lock() {
+                s.iter().any(|s| s.optimizing.load(Ordering::SeqCst))
+            } else {
+                return;
+            }
+        };
+        if any_running {
+            return;
+        }
+        let task = {
+            let mut q = queue.lock().unwrap();
+            q.pop_front()
+        };
+        let (slot, cfg, ffmpeg_path, output_path) = match task {
+            Some(t) => t,
+            None => return,
+        };
         logger.log(&format!("[Slot {}] Comprimiendo video (CRF {})...", slot, cfg.crf));
+
+        // Set optimizing flag before spawning
+        if let Ok(s) = slots.lock() {
+            s[slot].optimizing.store(true, Ordering::SeqCst);
+        }
 
         std::thread::spawn(move || {
             let actual = resolve_actual_file(&output_path);
             let tmp_path = format!("{}_tmp.mkv", output_path);
             logger.log(&format!("[Slot {}] Comprimiendo: {} → {} (archivo real: {})",
                 slot, output_path, tmp_path, actual));
-            logger.log(&format!("[Slot {}] Ejecutando: {} -i \"{}\" -c:v libx264 -preset {} -crf {} -c:a aac -b:a 128k -y \"{}\"",
-                slot, ffmpeg_path.display(), actual, cfg.preset, cfg.crf, tmp_path));
+            logger.log(&format!("[Slot {}] Ejecutando: {} -i \"{}\" -c:v libx264 -preset {} -crf {} -c:a aac -b:a 128k{} -af aresample=async=1:first_pts=0 -y \"{}\"",
+                slot, ffmpeg_path.display(), actual, cfg.preset, cfg.crf,
+                if cfg.threads > 0 { format!(" -threads {}", cfg.threads) } else { String::new() },
+                tmp_path));
 
             // Save original path for rename logic; use actual file as input
             let input_path = actual;
-            let output = create_command(&ffmpeg_path)
-                .args([
-                    "-i", &input_path,
-                    "-c:v", "libx264",
-                    "-preset", &cfg.preset,
-                    "-crf", &cfg.crf.to_string(),
-                    "-c:a", "aac",
-                    "-b:a", "128k",
-                    "-y", &tmp_path,
-                ])
+            let mut cmd = create_command(&ffmpeg_path);
+            cmd.arg("-i").arg(&input_path);
+            cmd.arg("-c:v").arg("libx264");
+            cmd.arg("-preset").arg(&cfg.preset);
+            cmd.arg("-crf").arg(cfg.crf.to_string());
+            cmd.arg("-c:a").arg("aac");
+            cmd.arg("-b:a").arg("128k");
+            if cfg.threads > 0 {
+                cmd.arg("-threads").arg(cfg.threads.to_string());
+            }
+            cmd.arg("-af").arg("aresample=async=1:first_pts=0");
+            cmd.arg("-y").arg(&tmp_path);
+            let output = cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -669,6 +714,55 @@ impl Recorder {
                 }
             }
             s.optimizing.store(false, Ordering::SeqCst);
+            // Next queued compression will be picked up by next get_all_statuses poll
+        });
+    }
+
+
+    fn spawn_sync_fixup(&self, slot: usize, ffmpeg_path: PathBuf, output_path: String) {
+        if output_path.is_empty() {
+            return;
+        }
+        let logger = self.logger.clone();
+        logger.log(&format!("[Slot {}] Corrigiendo sincronía de audio...", slot));
+
+        std::thread::spawn(move || {
+            let actual = resolve_actual_file(&output_path);
+            let tmp_path = format!("{}_syncfix.mkv", output_path);
+            logger.log(&format!("[Slot {}] Ajustando sync: {} → {} (archivo real: {})",
+                slot, output_path, tmp_path, actual));
+
+            let result = create_command(&ffmpeg_path)
+                .args([
+                    "-i", &actual,
+                    "-c:v", "copy",
+                    "-af", "aresample=async=1:first_pts=0",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-y", &tmp_path,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .and_then(|c| c.wait_with_output());
+
+            match result {
+                Ok(out) if out.status.success() => {
+                    let _ = std::fs::remove_file(&actual);
+                    let _ = std::fs::rename(&tmp_path, &output_path);
+                    logger.log(&format!("[Slot {}] Sincronía corregida: {}", slot, output_path));
+                }
+                Ok(out) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let msg = extract_error("", &stderr);
+                    logger.log(&format!("[Slot {}] Corrección de sync falló:\n{}", slot, msg));
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    logger.log(&format!("[Slot {}] Error al corregir sync: {}", slot, e));
+                }
+            }
         });
     }
 
@@ -690,6 +784,7 @@ impl Recorder {
         };
         let mut statuses = Vec::with_capacity(MAX_SLOTS);
         let mut pending_compress: Vec<(usize, CompressionConfig, PathBuf, String)> = Vec::new();
+        let mut pending_fixup: Vec<(usize, PathBuf, String)> = Vec::new();
         for (i, s) in slots.iter_mut().enumerate() {
             let running = match s.child.as_mut() {
                 Some(_) if s.optimizing.load(Ordering::SeqCst) => true,
@@ -703,9 +798,17 @@ impl Recorder {
                             // If compression was configured, save it before clearing info
                             let compress_cfg = s.info.as_ref().and_then(|i| i.compress.clone());
                             let out_path = s.info.as_ref().map(|i| i.output_path.clone());
-                            if let (Some(cfg), Some(path)) = (compress_cfg, out_path) {
+                            if let (Some(cfg), Some(path)) = (compress_cfg, out_path.clone()) {
                                 s.optimizing.store(true, Ordering::SeqCst);
                                 pending_compress.push((i, cfg, self.ffmpeg_path.clone(), path));
+                            } else if let Some(path) = out_path {
+                                // No compression — fix audio sync in background
+                                pending_fixup.push((i, self.ffmpeg_path.clone(), path));
+                                if s.error.lock().ok().and_then(|mut e| e.take()).is_none() {
+                                    if let Ok(mut e) = s.error.lock() {
+                                        *e = Some("Stream finalizado".to_string());
+                                    }
+                                }
                             } else if s.error.lock().ok().and_then(|mut e| e.take()).is_none() {
                                 // Stream ended without error and no compression — notify user
                                 if let Ok(mut e) = s.error.lock() {
@@ -739,6 +842,10 @@ impl Recorder {
         for (slot, cfg, ffmpeg, path) in pending_compress {
             self.spawn_compression(slot, cfg, ffmpeg, path);
         }
+        for (slot, ffmpeg, path) in pending_fixup {
+            self.spawn_sync_fixup(slot, ffmpeg, path);
+        }
+        self.dequeue_compress();
         statuses
     }
 
