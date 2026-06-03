@@ -4,6 +4,19 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+
+#[cfg(windows)]
+fn create_command<S: AsRef<std::ffi::OsStr>>(exe: S) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new(exe);
+    c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    c
+}
+
+#[cfg(not(windows))]
+fn create_command<S: AsRef<std::ffi::OsStr>>(exe: S) -> Command {
+    Command::new(exe)
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -139,7 +152,7 @@ impl Recorder {
             args.join(" "),
         ));
 
-        let output = Command::new(exe)
+        let output = create_command(exe)
             .args(&args)
             .output()
             .map_err(|e| format!("Error al ejecutar yt-dlp: {}", e))?;
@@ -289,7 +302,7 @@ impl Recorder {
             args.push(pd.to_string_lossy().to_string());
         }
         args.push(url.into());
-        if let Ok(output) = Command::new(exe).args(&args).output() {
+        if let Ok(output) = create_command(exe).args(&args).output() {
             if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                 let selected = data.get("format_id").and_then(|v| v.as_str());
                 if selected == Some(format_id) {
@@ -342,8 +355,11 @@ impl Recorder {
             args.push(pd.to_string_lossy().to_string());
         }
         if let Some(ffmpeg_dir) = self.ffmpeg_path.parent() {
-            args.push("--ffmpeg-location".into());
-            args.push(ffmpeg_dir.to_string_lossy().to_string());
+            let dir_str = ffmpeg_dir.to_string_lossy();
+            if !dir_str.is_empty() {
+                args.push("--ffmpeg-location".into());
+                args.push(dir_str.to_string());
+            }
         }
         args.extend_from_slice(&["-o".into(), output_path.into(), url.into()]);
 
@@ -353,7 +369,7 @@ impl Recorder {
             args.join(" "),
         ));
 
-        let mut process = match Command::new(exe)
+        let mut process = match create_command(exe)
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -436,7 +452,7 @@ impl Recorder {
             url,
             output_path
         ));
-        let mut process = match Command::new(exe)
+        let mut process = match create_command(exe)
             .args([url, "best", "-o", output_path])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -493,7 +509,7 @@ impl Recorder {
             url,
             output_path
         ));
-        let mut cmd = Command::new(exe);
+        let mut cmd = create_command(exe);
         cmd.args(["-i", url, "-c", "copy", "-f", "matroska", "-y", output_path]);
         let mut process = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         {
@@ -539,7 +555,7 @@ impl Recorder {
         let output_path = s.info.as_ref().map(|i| i.output_path.clone());
         if let Some(mut process) = s.child.take() {
             let pid = process.id();
-            let _ = Command::new("taskkill")
+            let _ = create_command("taskkill")
                 .args(["/F", "/T", "/PID", &pid.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -583,7 +599,7 @@ impl Recorder {
             logger.log(&format!("[Slot {}] Ejecutando: {} -i \"{}\" -c:v libx264 -preset {} -crf {} -c:a aac -b:a 128k -y \"{}\"",
                 slot, ffmpeg_path.display(), output_path, cfg.preset, cfg.crf, tmp_path));
 
-            let output = Command::new(&ffmpeg_path)
+            let output = create_command(&ffmpeg_path)
                 .args([
                     "-i", &output_path,
                     "-c:v", "libx264",
@@ -615,11 +631,11 @@ impl Recorder {
                 }
                 Ok(out) => {
                     let _ = std::fs::remove_file(&tmp_path);
-                    let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    let short = if msg.len() > 200 { format!("{}…", &msg[..200]) } else { msg };
-                    logger.log(&format!("[Slot {}] Compresión falló:\n{}", slot, short));
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let msg = extract_error("", &stderr);
+                    logger.log(&format!("[Slot {}] Compresión falló:\n{}", slot, msg));
                     if let Ok(mut e) = s.error.lock() {
-                        *e = Some(format!("Compresión falló: {}", short));
+                        *e = Some(format!("Compresión falló: {}", msg));
                     }
                 }
                 Err(e) => {
@@ -697,7 +713,7 @@ impl Recorder {
 
     pub fn preview_stream(&self, url: &str) -> Result<String, String> {
         let exe = &self.ffmpeg_path;
-        let mut cmd = Command::new(exe);
+        let mut cmd = create_command(exe);
         cmd.args([
             "-analyzeduration", "500000",
             "-probesize", "500000",
@@ -746,13 +762,13 @@ impl Recorder {
 
     /// Kill any lingering yt-dlp/ffmpeg processes (safety net for app close)
     pub fn kill_all() {
-        let _ = Command::new("taskkill")
+        let _ = create_command("taskkill")
             .args(["/F", "/IM", "yt-dlp.exe"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .and_then(|mut c| c.wait());
-        let _ = Command::new("taskkill")
+        let _ = create_command("taskkill")
             .args(["/F", "/IM", "ffmpeg.exe"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -824,16 +840,8 @@ fn find_binary(name: &str, fallback: &str, logger: &Logger) -> PathBuf {
 
     // Also search in Tauri resource directories (production build)
     for resource_dir in [exe_dir.join("resources"), exe_dir.join("_up_")] {
-        if let Ok(entries) = std::fs::read_dir(&resource_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(name) {
-                    candidates.push(p);
-                } else if p.is_dir() {
-                    candidates.push(p.join(name));
-                    candidates.push(p.join("bin").join(name));
-                }
-            }
+        if resource_dir.exists() {
+            scan_resource_dir(&resource_dir, name, &mut candidates, 3);
         }
     }
 
@@ -859,6 +867,27 @@ fn find_binary(name: &str, fallback: &str, logger: &Logger) -> PathBuf {
 
     logger.log(&format!("  → No encontrado, usando fallback: {}", fallback));
     PathBuf::from(fallback)
+}
+
+fn scan_resource_dir(dir: &std::path::Path, name: &str, candidates: &mut Vec<PathBuf>, max_depth: u32) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+                    candidates.push(p);
+                }
+            } else if p.is_dir() && max_depth > 0 {
+                candidates.push(p.join(name));
+                candidates.push(p.join("bin").join(name));
+                // Also check if the exe is inside a subfolder named after the binary (e.g. ffmpeg/ffmpeg.exe)
+                if let Some(stem) = std::path::Path::new(name).file_stem().and_then(|s| s.to_str()) {
+                    candidates.push(p.join(stem).join(name));
+                }
+                scan_resource_dir(&p, name, candidates, max_depth - 1);
+            }
+        }
+    }
 }
 
 fn is_valid_executable(path: &std::path::Path) -> bool {
