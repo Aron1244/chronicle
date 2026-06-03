@@ -842,6 +842,15 @@ fn resolve_actual_file(output_path: &str) -> String {
     if path.exists() {
         return output_path.to_string();
     }
+    // yt-dlp sometimes appends .mp4/.ts to the output filename
+    // (e.g. file.mkv → file.mkv.mp4) because the actual container
+    // format differs from the -o extension
+    for ext in &["mp4", "ts", "flv", "webm", "mkv", "mov"] {
+        let candidate = format!("{}.{}", output_path, ext);
+        if std::path::Path::new(&candidate).exists() {
+            return candidate;
+        }
+    }
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let parent = path.parent().unwrap_or(std::path::Path::new(""));
     for ext in &["mp4", "ts", "flv", "webm", "mkv", "mov"] {
