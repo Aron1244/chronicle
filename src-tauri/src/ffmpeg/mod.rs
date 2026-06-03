@@ -216,7 +216,15 @@ impl Recorder {
         let s = &mut slots[slot];
 
         if s.child.is_some() {
-            return Err(format!("Slot {} ya está grabando", slot));
+            let dead = s.child.as_mut()
+                .and_then(|p| p.try_wait().ok())
+                .flatten()
+                .is_some();
+            if !dead {
+                return Err(format!("Slot {} ya está grabando", slot));
+            }
+            let _ = s.child.take();
+            s.info = None;
         }
 
         if let Ok(mut e) = s.error.lock() {
@@ -667,9 +675,34 @@ impl Recorder {
             Err(_) => return Vec::new(),
         };
         let mut statuses = Vec::with_capacity(MAX_SLOTS);
+        let mut pending_compress: Vec<(usize, CompressionConfig, PathBuf, String)> = Vec::new();
         for (i, s) in slots.iter_mut().enumerate() {
             let running = match s.child.as_mut() {
-                Some(p) => p.try_wait().ok().map(|opt| opt.is_none()).unwrap_or(false),
+                Some(_) if s.optimizing.load(Ordering::SeqCst) => true,
+                Some(p) => {
+                    match p.try_wait() {
+                        Ok(None) => true,
+                        _ => {
+                            let _ = p.kill();
+                            let _ = p.wait();
+                            s.child = None;
+                            // If compression was configured, save it before clearing info
+                            let compress_cfg = s.info.as_ref().and_then(|i| i.compress.clone());
+                            let out_path = s.info.as_ref().map(|i| i.output_path.clone());
+                            if let (Some(cfg), Some(path)) = (compress_cfg, out_path) {
+                                s.optimizing.store(true, Ordering::SeqCst);
+                                pending_compress.push((i, cfg, self.ffmpeg_path.clone(), path));
+                            } else if s.error.lock().ok().and_then(|mut e| e.take()).is_none() {
+                                // Stream ended without error and no compression — notify user
+                                if let Ok(mut e) = s.error.lock() {
+                                    *e = Some("Stream finalizado".to_string());
+                                }
+                            }
+                            s.info = None;
+                            false
+                        }
+                    }
+                }
                 None => false,
             };
             let optimizing = s.optimizing.load(Ordering::SeqCst);
@@ -687,6 +720,10 @@ impl Recorder {
                 label,
                 elapsed_secs,
             });
+        }
+        drop(slots);
+        for (slot, cfg, ffmpeg, path) in pending_compress {
+            self.spawn_compression(slot, cfg, ffmpeg, path);
         }
         statuses
     }
