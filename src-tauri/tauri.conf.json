@@ -34,6 +34,12 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
+    ],
+    "resources": [
+      "../yt-dlp/yt-dlp.exe",
+      "../streamlink-8.4.0-1-py314-x86_64/ffmpeg/ffmpeg.exe",
+      "../streamlink-8.4.0-1-py314-x86_64/bin/streamlink.exe",
+      "../yt-dlp-plugins/**/*"
     ]
   }
 }
