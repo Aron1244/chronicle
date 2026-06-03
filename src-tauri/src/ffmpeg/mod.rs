@@ -71,6 +71,7 @@ struct SlotState {
     error: Arc<Mutex<Option<String>>>,
     info: Option<SlotInfo>,
     optimizing: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl SlotState {
@@ -80,6 +81,7 @@ impl SlotState {
             error: Arc::new(Mutex::new(None)),
             info: None,
             optimizing: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -227,6 +229,7 @@ impl Recorder {
             s.info = None;
         }
 
+        s.stopping.store(false, Ordering::SeqCst);
         if let Ok(mut e) = s.error.lock() {
             *e = None;
         }
@@ -420,6 +423,7 @@ impl Recorder {
         let err_child = process.stderr.take();
         let logger = self.logger.clone();
         let error_state = slot.error.clone();
+        let stopping_flag = slot.stopping.clone();
         let child_for_monitor = process.try_wait().ok().flatten();
         if err_child.is_some() && child_for_monitor.is_none() {
             std::thread::spawn(move || {
@@ -431,8 +435,11 @@ impl Recorder {
                             if l.contains("ERROR") || l.contains("ffmpeg exited with code") || l.contains("Error opening input") {
                                 let err_msg = l.trim().to_string();
                                 logger.log(&format!("⚠ Error detectado: {}", err_msg));
-                                if let Ok(mut e) = error_state.lock() {
-                                    *e = Some(err_msg);
+                                // Don't set error if stop() was called intentionally
+                                if !stopping_flag.load(Ordering::SeqCst) {
+                                    if let Ok(mut e) = error_state.lock() {
+                                        *e = Some(err_msg);
+                                    }
                                 }
                             }
                         }
@@ -555,6 +562,8 @@ impl Recorder {
         let mut slots = self.slots.lock().map_err(|e| e.to_string())?;
         let s = &mut slots[slot];
         self.logger.log(&format!("[Slot {}] Deteniendo grabación...", slot));
+        // Signal monitor thread to ignore stderr errors from the kill
+        s.stopping.store(true, Ordering::SeqCst);
         if let Ok(mut e) = s.error.lock() {
             *e = None;
         }
