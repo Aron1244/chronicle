@@ -603,13 +603,18 @@ impl Recorder {
         logger.log(&format!("[Slot {}] Comprimiendo video (CRF {})...", slot, cfg.crf));
 
         std::thread::spawn(move || {
+            let actual = resolve_actual_file(&output_path);
             let tmp_path = format!("{}_tmp.mkv", output_path);
+            logger.log(&format!("[Slot {}] Comprimiendo: {} → {} (archivo real: {})",
+                slot, output_path, tmp_path, actual));
             logger.log(&format!("[Slot {}] Ejecutando: {} -i \"{}\" -c:v libx264 -preset {} -crf {} -c:a aac -b:a 128k -y \"{}\"",
-                slot, ffmpeg_path.display(), output_path, cfg.preset, cfg.crf, tmp_path));
+                slot, ffmpeg_path.display(), actual, cfg.preset, cfg.crf, tmp_path));
 
+            // Save original path for rename logic; use actual file as input
+            let input_path = actual;
             let output = create_command(&ffmpeg_path)
                 .args([
-                    "-i", &output_path,
+                    "-i", &input_path,
                     "-c:v", "libx264",
                     "-preset", &cfg.preset,
                     "-crf", &cfg.crf.to_string(),
@@ -633,7 +638,7 @@ impl Recorder {
 
             match output {
                 Ok(out) if out.status.success() => {
-                    let _ = std::fs::remove_file(&output_path);
+                    let _ = std::fs::remove_file(&input_path);
                     let _ = std::fs::rename(&tmp_path, &output_path);
                     logger.log(&format!("[Slot {}] Compresión completada: {}", slot, output_path));
                 }
@@ -821,6 +826,22 @@ fn status_success(process: &mut Child) -> bool {
         Ok(None) => true, // still running
         Err(_) => false,
     }
+}
+
+fn resolve_actual_file(output_path: &str) -> String {
+    let path = std::path::Path::new(output_path);
+    if path.exists() {
+        return output_path.to_string();
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let parent = path.parent().unwrap_or(std::path::Path::new(""));
+    for ext in &["mp4", "ts", "flv", "webm", "mkv", "mov"] {
+        let candidate = parent.join(format!("{}.{}", stem, ext));
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    output_path.to_string()
 }
 
 fn extract_error(stdout: &str, stderr: &str) -> String {
